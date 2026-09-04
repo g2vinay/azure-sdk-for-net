@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 using System;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
@@ -73,6 +74,18 @@ namespace Azure.Core.Pipeline
         public static readonly HttpClientTransport Shared = new HttpClientTransport();
 
         private volatile HttpClientWrapper _clientWrapper;
+
+        // Per-certificate client cache for mTLS Proof-of-Possession token binding. Each entry is an
+        // HttpClientWrapper whose HttpClient is configured with a specific client certificate, keyed
+        // by that certificate's thumbprint. At send time the transport selects the client matching
+        // the certificate recorded on the message (see TokenBindingCertificateKey), so a request
+        // whose token is bound to certificate C1 is sent over C1 even if a concurrent request rotated
+        // the shared client to C2. Each cache entry holds its own reference on the wrapper, so a
+        // concurrent Update that swaps and releases the shared client cannot dispose a client still
+        // needed here. The cache is bounded to avoid unbounded HttpClient growth as certificates rotate.
+        private readonly ConcurrentDictionary<string, HttpClientWrapper> _boundClients = new ConcurrentDictionary<string, HttpClientWrapper>(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentQueue<string> _boundClientInsertionOrder = new ConcurrentQueue<string>();
+        private const int MaxBoundClients = 8;
 
         // The transport's private HttpClient is internal because it is used by tests.
         internal HttpClient Client => _clientWrapper.Client ?? throw new ObjectDisposedException(nameof(HttpClientTransport));
@@ -184,6 +197,83 @@ namespace Azure.Core.Pipeline
 
             // Release the transport's reference to the old client
             oldWrapper?.Release();
+
+            // Index the new client by its binding certificate thumbprint(s) so concurrent requests
+            // are routed to the certificate their token was bound to (per-request affinity).
+            IndexBoundClients(options, newWrapper);
+        }
+
+        private void IndexBoundClients(HttpPipelineTransportOptions options, HttpClientWrapper wrapper)
+        {
+            var certificates = options.ClientCertificates;
+            if (certificates.Count == 0)
+            {
+                return;
+            }
+
+            for (int i = 0; i < certificates.Count; i++)
+            {
+                string thumbprint = certificates[i].Thumbprint;
+
+                // Take an owning reference for the cache entry so a concurrent Update that swaps and
+                // releases the shared client cannot dispose a client this cache still holds.
+                if (wrapper.IsRefCountingEnabled && !wrapper.TryAddRef())
+                {
+                    return; // wrapper already disposed; nothing to cache
+                }
+
+                _boundClients.AddOrUpdate(
+                    thumbprint,
+                    wrapper,
+                    (_, previous) =>
+                    {
+                        if (previous.IsRefCountingEnabled)
+                        {
+                            previous.Release();
+                        }
+                        return wrapper;
+                    });
+                _boundClientInsertionOrder.Enqueue(thumbprint);
+            }
+
+            EvictBoundClientsIfNeeded();
+        }
+
+        private void EvictBoundClientsIfNeeded()
+        {
+            while (_boundClients.Count > MaxBoundClients && _boundClientInsertionOrder.TryDequeue(out var thumbprint))
+            {
+                // Drop only the cache's reference; in-flight sends hold their own reference and keep
+                // the client alive until they complete.
+                if (_boundClients.TryRemove(thumbprint, out var evicted) && evicted.IsRefCountingEnabled)
+                {
+                    evicted.Release();
+                }
+            }
+        }
+
+        // Returns a client wrapper with a reference already added (the caller must Release it). When
+        // the message carries a token-binding certificate, the client bound to that exact certificate
+        // is returned; otherwise the current shared client is used (unchanged, non-bound behavior).
+        private HttpClientWrapper AcquireClientWrapper(HttpMessage message)
+        {
+            if (message.TryGetProperty(typeof(BearerTokenAuthenticationPolicy.TokenBindingCertificateKey), out var value)
+                && value is X509Certificate2 certificate
+                && _boundClients.TryGetValue(certificate.Thumbprint, out var bound))
+            {
+                if (!bound.IsRefCountingEnabled || bound.TryAddRef())
+                {
+                    return bound;
+                }
+                // The bound client was evicted and disposed between lookup and ref; fall back below.
+            }
+
+            HttpClientWrapper shared = _clientWrapper;
+            if (shared.IsRefCountingEnabled && !shared.TryAddRef())
+            {
+                throw new ObjectDisposedException(nameof(HttpClientTransport));
+            }
+            return shared;
         }
 
         /// <inheritdoc />
@@ -216,12 +306,9 @@ namespace Azure.Core.Pipeline
             Stream? contentStream = null;
             message.ClearResponse();
 
-            // Get reference-counted access to the client
-            var clientWrapper = _clientWrapper;
-            if (clientWrapper.IsRefCountingEnabled && !clientWrapper.TryAddRef())
-            {
-                throw new ObjectDisposedException(nameof(HttpClientTransport));
-            }
+            // Get reference-counted access to the client, honoring per-request certificate affinity
+            // for mTLS token binding (falls back to the shared client for non-bound requests).
+            var clientWrapper = AcquireClientWrapper(message);
 
             try
             {
@@ -419,6 +506,16 @@ namespace Azure.Core.Pipeline
             if (this != Shared)
             {
                 _clientWrapper?.Release();
+
+                // Release the cache's references to any per-certificate bound clients.
+                foreach (var entry in _boundClients)
+                {
+                    if (entry.Value.IsRefCountingEnabled)
+                    {
+                        entry.Value.Release();
+                    }
+                }
+                _boundClients.Clear();
             }
 
             GC.SuppressFinalize(this);

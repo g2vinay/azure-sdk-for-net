@@ -269,7 +269,7 @@ namespace Azure.Core.Pipeline
         {
             var headerValueInfo = await _accessTokenCache.GetAuthHeaderValueAsync(message, context, true).ConfigureAwait(false);
             message.Request.Headers.SetValue(HttpHeader.Names.Authorization, headerValueInfo.HeaderValue);
-            UpdateTransportOptionsIfNeeded(headerValueInfo);
+            UpdateTransportOptionsIfNeeded(message, headerValueInfo);
         }
 
         /// <summary>
@@ -281,7 +281,7 @@ namespace Azure.Core.Pipeline
         {
             var headerValueInfo = _accessTokenCache.GetAuthHeaderValueAsync(message, context, false).EnsureCompleted();
             message.Request.Headers.SetValue(HttpHeader.Names.Authorization, headerValueInfo.HeaderValue);
-            UpdateTransportOptionsIfNeeded(headerValueInfo);
+            UpdateTransportOptionsIfNeeded(message, headerValueInfo);
         }
 
         /// <summary>
@@ -295,13 +295,19 @@ namespace Azure.Core.Pipeline
             TransportOptionsChanged?.Invoke(options);
         }
 
-        private void UpdateTransportOptionsIfNeeded(AccessTokenCache.AuthHeaderValueInfo headerValueInfo)
+        private void UpdateTransportOptionsIfNeeded(HttpMessage message, AccessTokenCache.AuthHeaderValueInfo headerValueInfo)
         {
             var newCert = headerValueInfo.BindingCertificate;
             if (newCert == null)
             {
                 return;
             }
+
+            // Record the binding certificate on the message so the transport can send this request
+            // over the matching client certificate at send time (per-request certificate affinity).
+            // This is done for every request that has a binding certificate - even when it is
+            // unchanged from the previous request - so it must happen before the change check below.
+            message.SetProperty(typeof(TokenBindingCertificateKey), newCert);
 
             if (_lastBindingCertificate != null && _lastBindingCertificate.Equals(newCert))
             {
@@ -617,6 +623,14 @@ namespace Azure.Core.Pipeline
         // authority that this policy last authorized against. Used to detect cross-host
         // redirects so we can suppress re-authorization of the redirected request.
         private class AuthorizedRequestAuthorityKey
+        {
+        }
+
+        // Marker used as the HttpMessage property key for the mTLS Proof-of-Possession binding
+        // certificate selected for a request. The transport reads this to send the request over the
+        // matching client certificate (per-request certificate affinity), so a token bound to one
+        // certificate is never sent over another when binding certificates rotate concurrently.
+        internal sealed class TokenBindingCertificateKey
         {
         }
     }
